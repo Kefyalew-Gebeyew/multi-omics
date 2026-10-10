@@ -1,0 +1,217 @@
+
+
+###--------------Community types (CT) pie chart across age time points in rumen ---------------###
+
+# Load necessary libraries
+library(phyloseq)
+library(metagenomeSeq)
+library(DirichletMultinomial)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(scales)
+library(viridis)
+
+REGION <- "Rumen"
+
+## ---- 1. Load & build phyloseq ------------------------------------------------
+otu  <- read.csv("OTU_kefe.csv", check.names = FALSE, row.names = 1)
+meta <- read.csv("SampleID.csv", stringsAsFactors = FALSE)
+taxa <- read.csv("Taxa.csv", check.names = FALSE, row.names = 1)
+taxa[is.na(taxa)] <- "Unclassified"
+meta$SampleID <- as.character(meta$SampleID)
+rownames(meta) <- meta$SampleID
+
+physeq <- phyloseq(
+  otu_table(as.matrix(otu), taxa_are_rows = FALSE),
+  sample_data(meta),
+  tax_table(as.matrix(taxa))
+)
+
+## ---- 2. Subset to ONE region FIRST, then filter within it --------------------
+pseq_r <- subset_samples(physeq, Tissue == REGION)
+pseq_r <- prune_taxa(taxa_sums(pseq_r) > 0, pseq_r)
+message(sprintf("%s: %d samples, %d OTUs", REGION, nsamples(pseq_r), ntaxa(pseq_r)))
+
+## Within-region abundance filter (NOT grand-total across tissues)
+thr <- 0.005
+keep <- taxa_sums(pseq_r) > thr * sum(taxa_sums(pseq_r))
+pseq_r <- prune_taxa(keep, pseq_r)
+pseq_g <- tax_glom(pseq_r, "Genus")
+taxa_names(pseq_g) <- as.character(tax_table(pseq_g)[, "Genus"])
+message(sprintf("After within-region filter + genus glom: %d genera", ntaxa(pseq_g)))
+
+## ---- 4. DMM input (integer sample x genus matrix) ----------------------------
+mat <- as(otu_table(pseq_g), "matrix")
+if (taxa_are_rows(pseq_g)) mat <- t(mat)
+mat <- round(mat); storage.mode(mat) <- "integer"
+mat <- mat[rowSums(mat) > 0, ]
+
+## ---- 5. Fit k = 1..6 WITH the full curve (k=1 = "no structure" null) ---------
+kseq <- 1:6
+fits <- lapply(kseq, function(k) dmn(mat, k = k, verbose = FALSE, seed = 1))
+lap  <- sapply(fits, laplace)         # lower = better
+curve_df <- data.frame(k = kseq, Laplace = lap)
+print(curve_df)
+
+best_k <- kseq[which.min(lap)]
+delta_1 <- lap[1] - min(lap)          
+message(sprintf("Best k = %d; improvement over k=1 (no-cluster null): %.1f Laplace units",
+                best_k, delta_1))
+if (best_k == 1 || delta_1 < 5) {     # heuristic; inspect the curve yourself
+  message("WARNING: k=1 is competitive -- little evidence for discrete community types.")
+}
+
+ggplot(curve_df, aes(k, Laplace)) + geom_line() + geom_point(size = 3) +
+  geom_point(data = subset(curve_df, k == best_k), colour = "red", size = 4) +
+  scale_x_continuous(breaks = kseq) + theme_bw() +
+  labs(title = sprintf("%s DMM model fit", REGION),
+       y = "Laplace (lower = better fit)")
+ggsave(sprintf("dmm_laplace_%s.png", tolower(REGION)), width = 6, height = 4, dpi = 300)
+
+## ---- 6. Posterior assignment via mixture() (NOT predict) ----------------------
+best <- fits[[which.min(lap)]]
+assign_prob <- mixture(best)                       # samples x components, posterior
+enterotype  <- apply(assign_prob, 1, which.max)
+max_post    <- apply(assign_prob, 1, max)
+message(sprintf("Mean max posterior = %.2f (low values => uncertain assignment)",
+                mean(max_post)))
+
+meta_r <- data.frame(sample_data(pseq_g))
+meta_r <- meta_r[rownames(mat), ]
+meta_r$CommunityType <- factor(enterotype)
+meta_r$Age <- as.integer(as.character(meta_r$Age))
+print(table(meta_r$CommunityType))
+
+## ---- 7. Component driver taxa (Dirichlet parameters) -------------------------
+drivers <- fitted(best)                # genus x component
+write.csv(drivers, sprintf("dmm_drivers_%s.csv", tolower(REGION)))
+
+## ---- 8. Prevalence by age: TREND TEST (replaces the invalid Markov chain) -----
+## Cross-sectional data cannot estimate transition probabilities. Instead test
+## whether community-type prevalence changes monotonically with age.
+tab <- table(meta_r$Age, meta_r$CommunityType)
+print(tab)
+
+if (nlevels(meta_r$CommunityType) == 2) {
+  y <- as.integer(meta_r$CommunityType == levels(meta_r$CommunityType)[2])
+  print(prop.trend.test(x = tapply(y, meta_r$Age, sum),
+                        n = tapply(y, meta_r$Age, length)))
+} else {
+  library(nnet)
+  print(summary(multinom(CommunityType ~ Age, data = meta_r)))
+}
+
+## ---- 9. Pie charts: community-type prevalence across age ---------------------
+pie_df <- meta_r %>%
+  count(Age, CommunityType, .drop = FALSE) %>%
+  group_by(Age) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup() %>%
+  filter(n > 0)
+
+# Fixed palette: type 1 = dark purple, type 2 = light green, type 3 = teal
+pal <- c("1" = "#440154", "2" = "#9BDB3D", "3" = "#21908C")
+
+n_per_age <- paste(unique(as.integer(table(meta_r$Age))), collapse = "-")
+
+p_pie <- ggplot(pie_df, aes(x = "", y = prop, fill = CommunityType)) +
+  geom_col(width = 1, colour = "white", linewidth = 0.3) +
+  coord_polar(theta = "y") +
+  facet_wrap(~ Age, nrow = 1, strip.position = "bottom") +
+  scale_fill_manual(values = pal, name = NULL) +
+  theme_void() +
+  theme(
+    panel.border      = element_rect(colour = "black", fill = NA, linewidth = 0.8),
+    strip.placement   = "outside",
+    strip.background  = element_rect(fill = "grey90", colour = NA),
+    strip.text        = element_text(face = "bold", size = 11, margin = margin(2, 0, 2, 0)),
+    plot.title        = element_text(hjust = 0.5, size = 13),
+    plot.caption      = element_text(hjust = 0, colour = "grey40"),
+    legend.position   = "right"
+  ) +
+  labs(title   = sprintf("%s community-type prevalence across age (months)", REGION),
+       caption = sprintf("%s samples per age.", n_per_age))
+
+ggsave(sprintf("community_type_pies_%s.png", tolower(REGION)),
+       p_pie, width = 12, height = 4, dpi = 300, bg = "white")
+
+
+##------------------Top genera by RUMEN community type (k=2), stacked bar-------------------------########
+
+data_dir <- "/Users/kefe/Desktop/Data/Bacterial genera/DMN_Genera"
+REGION   <- "Rumen"; thr <- 0.005; N_TOP <- 12
+
+## ---- rebuild rumen genus table (same recipe as DMM/PCoA) ---------------------
+otu  <- read.csv(file.path(data_dir, "OTU_kefe.csv"), check.names = FALSE, row.names = 1)
+meta <- read.csv(file.path(data_dir, "SampleID.csv"), stringsAsFactors = FALSE)
+taxa <- read.csv(file.path(data_dir, "Taxa.csv"),     check.names = FALSE, row.names = 1)
+taxa[is.na(taxa)] <- "Unclassified"
+meta$SampleID <- as.character(meta$SampleID); rownames(meta) <- meta$SampleID
+physeq <- phyloseq(otu_table(as.matrix(otu), taxa_are_rows = FALSE),
+                   sample_data(meta), tax_table(as.matrix(taxa)))
+keep_s <- sample_names(physeq)[as.character(sample_data(physeq)$Tissue) == REGION]
+ps  <- prune_samples(keep_s, physeq); ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+ps  <- prune_taxa(taxa_sums(ps) > thr * sum(taxa_sums(ps)), ps)
+psg <- tax_glom(ps, "Genus")
+taxa_names(psg) <- make.unique(as.character(tax_table(psg)[, "Genus"]))
+
+## ---- attach VALIDATED k=2 community type -------------------------------------
+ct <- read.csv(sprintf("community_types_%s.csv", tolower(REGION)), stringsAsFactors = FALSE)
+rel <- transform_sample_counts(psg, function(x) x / sum(x))
+df  <- psmelt(rel)
+df$CommunityType <- factor(paste0("CT", ct$CommunityType[match(df$Sample, ct$SampleID)]))
+stopifnot(!any(is.na(df$CommunityType)))
+
+## ---- mean relative abundance per type, top N + Other -------------------------
+mean_ab <- df %>%
+  group_by(CommunityType, Genus) %>%
+  summarise(mean_ra = mean(Abundance), .groups = "drop")
+
+## rank genera by overall mean abundance; keep top N, lump rest as "Other"
+rank_g <- mean_ab %>% group_by(Genus) %>% summarise(m = mean(mean_ra)) %>%
+  arrange(desc(m)); top_g <- head(rank_g$Genus, N_TOP)
+
+## order genera so the two CT1 vs CT2 discriminators read clearly:
+## sort by (CT2 mean - CT1 mean) so CT1-enriched taxa stack at bottom, CT2 at top
+wide <- mean_ab %>% filter(Genus %in% top_g) %>%
+  pivot_wider(names_from = CommunityType, values_from = mean_ra, values_fill = 0)
+if (all(c("CT1","CT2") %in% names(wide)))
+  gorder <- wide$Genus[order(wide$CT2 - wide$CT1)] else gorder <- top_g
+
+plot_df <- mean_ab %>%
+  mutate(Genus = ifelse(Genus %in% top_g, Genus, "Other")) %>%
+  group_by(CommunityType, Genus) %>% summarise(mean_ra = sum(mean_ra), .groups = "drop") %>%
+  group_by(CommunityType) %>% mutate(prop = mean_ra / sum(mean_ra)) %>% ungroup() %>%
+  mutate(Genus = factor(Genus, levels = c("Other", gorder)))
+
+## ---- palette: user's custom colours, distinct (not interpolated) -------------
+## Grey is intentionally excluded from the genus set and reserved for "Other".
+custom_cols <- c("#808000", "blue", "black", "yellow", "orange", "purple",
+                 "brown", "pink", "cyan", "magenta", "#00FF00", "red",
+                 "navy", "violet", "turquoise", "gold", "darkgreen", "darkred",
+                 "green")   # 19 distinct colours; grey removed (used for Other)
+if (length(gorder) > length(custom_cols))
+  stop(sprintf("Need %d colours but only %d defined; add more or lower N_TOP.",
+               length(gorder), length(custom_cols)))
+pal <- setNames(custom_cols[seq_along(gorder)], gorder)
+pal["Other"] <- "grey80"
+
+p <- ggplot(plot_df, aes(CommunityType, prop, fill = Genus)) +
+  geom_col(width = 0.7, colour = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.02))) +
+  scale_fill_manual(values = pal, breaks = rev(gorder)) +   # legend top-to-bottom = stack
+  labs(x = NULL, y = "Mean relative abundance",
+       title = sprintf("%s: genus composition by community type", REGION),
+       fill = "Genus") +
+  theme_bw(base_size = 13) +
+  theme(panel.grid = element_blank(),
+        legend.text = element_text(face = "italic"),
+        panel.border = element_rect(colour = "black", fill = NA, linewidth = 0.8))
+
+ggsave(sprintf("top_genera_%s_by_type.png", tolower(REGION)),
+       p, width = 6.5, height = 7, dpi = 300, bg = "white")
+print(p)
+
+## also write the underlying numbers for the legend/table
+write.csv(plot_df, sprintf("top_genera_%s_by_type.csv", tolower(REGION)), row.names = FALSE)
